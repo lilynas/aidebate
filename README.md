@@ -33,7 +33,7 @@
 
 ### 第一步：下载项目文件
 
-使用`git clone git@github.com:lilynas/aidebate.git`到您的项目。
+使用`git clone git@github.com:lilynas/aidebate.git`
 
 ### 第二步：创建并配置 `config.ini`
 

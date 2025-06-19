@@ -1,16 +1,20 @@
 import os
-import json
-import datetime
+import openai
 import configparser
-from openai import OpenAI
+import datetime
+import re
+import json
 
-# --- 1. 配置加载 ---
+# --- 1. 配置加载 (已修复编码问题) ---
 def load_config():
     """从 config.ini 加载配置"""
     config = configparser.ConfigParser()
     if not os.path.exists('config.ini'):
         raise FileNotFoundError("错误：未找到 config.ini 配置文件。请根据说明创建该文件。")
+    
+    # 明确指定使用 utf-8 编码读取配置文件
     config.read('config.ini', encoding='utf-8')
+    
     return {
         'base_url': config['openai']['base_url'],
         'api_key': config['openai']['api_key'],
@@ -18,174 +22,254 @@ def load_config():
         'judge_model_name': config['openai']['judge_model_name']
     }
 
-# --- 2. AI 代理类 ---
-class AIAgent:
-    """一个通用的AI代理，可以代表辩手或裁判"""
-    def __init__(self, client, model, system_message):
-        self.client = client
-        self.model = model
-        self.system_message = system_message
+# --- 2. AI 模型交互 ---
+def get_ai_response(client, model_name, messages):
+    """获取 AI 模型的响应"""
+    try:
+        response = client.chat.completions.create(
+            model=model_name,
+            messages=messages,
+            temperature=0.7, # 保持一定的创造性
+        )
+        return response.choices[0].message.content.strip()
+    except Exception as e:
+        print(f"[!] 调用API时发生错误: {e}")
+        # 在真实应用中可能需要更复杂的错误处理，例如重试
+        return "抱歉，我在思考时遇到了一个问题，无法继续发言。"
 
-    def speak(self, history):
-        """根据对话历史生成回应"""
-        messages = [{"role": "system", "content": self.system_message}] + history
-        try:
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=messages,
-                temperature=0.7, # 增加一点创造性
-            )
-            return response.choices[0].message.content
-        except Exception as e:
-            return f"调用API时出错: {e}"
+# --- 3. 辩论流程控制 ---
+def run_debate(client, settings):
+    """运行完整的辩论流程"""
+    topic = settings['topic']
+    max_rounds = settings['max_rounds']
+    pro_role = settings['pro_role']
+    con_role = settings['con_role']
+    pro_system_prompt = settings['pro_system_prompt']
+    con_system_prompt = settings['con_system_prompt']
 
-# --- 3. 辩论记录保存 ---
-def save_debate_records(topic, history):
-    """将辩论记录保存为 JSON 和 TXT 文件"""
-    # 确保 debates 目录存在
-    if not os.path.exists('debates'):
-        os.makedirs('debates')
-
-    # 创建一个安全的文件名
-    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    safe_topic = "".join(x for x in topic if x.isalnum() or x in " -_").rstrip()
-    base_filename = f"debates/{timestamp}_{safe_topic}"
-
-    # 保存为 JSON 格式
-    json_filename = f"{base_filename}.json"
-    with open(json_filename, 'w', encoding='utf-8') as f:
-        json.dump(history, f, ensure_ascii=False, indent=4)
-    print(f"\n[+] 完整的JSON记录已保存至: {json_filename}")
-
-    # 保存为易读的 TXT 格式
-    txt_filename = f"{base_filename}.txt"
-    with open(txt_filename, 'w', encoding='utf-8') as f:
-        f.write(f"辩论主题: {topic}\n")
-        f.write("="*40 + "\n\n")
-        for entry in history:
-            role = entry.get('role_name', entry.get('role'))
-            content = entry.get('content', '')
-            f.write(f"[{role}]:\n{content}\n\n")
-            f.write("-"*40 + "\n")
-    print(f"[+] 易读的文本记录已保存至: {txt_filename}")
-
-
-# --- 4. 主辩论流程 ---
-def run_debate(client, model_name, judge_model_name):
-    """运行整个辩论流程"""
-    print("--- 欢迎来到AI自动辩论工具 ---")
-
-    # --- 用户输入 ---
-    topic = input("请输入辩论主题: ")
-    max_rounds = int(input("请输入最大辩论轮数: "))
-
-    print("\n--- 设置双方角色信息 ---")
-    pro_desc = input("请输入支持方(正方)的角色描述 (例如：一位乐观的技术专家): ")
-    con_desc = input("请输入反对方的角色描述 (例如：一位谨慎的社会伦理学者): ")
+    # 初始化对话历史
+    debate_history = []
     
-    # 参与人数 (当前版本默认为1v1，为未来扩展保留)
-    # num_participants = int(input("请输入参与辩论的人数 (目前仅支持2人): "))
-    # if num_participants != 2:
-    #     print("当前版本仅支持2人辩论，将按2人进行。")
+    # 定义AI角色
+    judge_model = settings['judge_model_name']
+    debater_model = settings['model_name']
 
-    # 可选的 System Message
-    print("\n您可以为AI提供更底层的指令 (System Message)，留空则使用默认值。")
-    pro_sm_override = input("请输入正方的 System Message (可选): ")
-    con_sm_override = input("请输入反方的 System Message (可选): ")
-
-    # --- 初始化 AI 代理 ---
-    # 默认 System Message
-    default_pro_sm = f"你是一位辩手，你的身份是“{pro_desc}”。你的任务是清晰、有说服力地论证“{topic}”这一观点的正确性。请使用事实、逻辑和例子来支持你的论点，并有力地反驳对方的观点。保持你的角色，观点要鲜明。"
-    default_con_sm = f"你是一位辩手，你的身份是“{con_desc}”。你的任务是清晰、有说服力地反对“{topic}”这一观点。请使用事实、逻辑和例子来支持你的论点，并有力地反驳对方的观点。保持你的角色，观点要鲜明。"
-    referee_sm = f"你是一位经验丰富、绝对中立的辩论裁判。你的任务是主持一场关于“{topic}”的辩论。辩论双方分别是正方({pro_desc})和反方({con_desc})。你需要：1.宣布辩论开始。2.在每轮之间进行简短的串场，引导讨论。3.在辩论结束后，根据双方的论证质量、逻辑严谨性和说服力，宣布获胜方，并给出清晰、公正的评判理由。你的评判必须只基于本场辩论的表现。"
-
-    pro_system_message = pro_sm_override if pro_sm_override else default_pro_sm
-    con_system_message = con_sm_override if con_sm_override else default_con_sm
-
-    pro_agent = AIAgent(client, model_name, pro_system_message)
-    con_agent = AIAgent(client, model_name, con_system_message)
-    referee_agent = AIAgent(client, judge_model_name, referee_sm)
-
-    # --- 开始辩论 ---
-    history = []
-    print("\n" + "="*20 + " 辩论开始 " + "="*20)
+    # --- 开场白 ---
+    print("==================== 辩论开始 ====================")
+    judge_intro_prompt = f"""你是一位辩论比赛的裁判。你的任务是主持一场关于“{topic}”的辩论。
+请先说一段开场白，介绍辩论主题，以及正方（角色：{pro_role}）和反方（角色：{con_role}）。
+然后，宣布辩论开始，并邀请正方首先发言。
+你的发言需要保持中立、客观，并营造一种正式而专业的辩论氛围。"""
     
-    # 裁判开场
-    print("\n--- 裁判 ---")
-    opening_statement = referee_agent.speak(history)
-    print(opening_statement)
-    history.append({"role": "assistant", "role_name": "裁判", "content": opening_statement})
+    judge_messages = [{"role": "system", "content": judge_intro_prompt}]
+    intro = get_ai_response(client, judge_model, judge_messages)
+    print(f"\n--- 裁判 ---\n{intro}\n")
+    debate_history.append({"role": "裁判", "content": intro})
     
-    # 辩论循环
-    for i in range(1, max_rounds + 1):
-        print("\n" + f"--- 第 {i} 轮 ---")
+    # 更新裁判的记忆，让它知道自己已经说完了开场白
+    judge_messages.append({"role": "assistant", "content": intro})
+
+    # --- 辩论循环 ---
+    for i in range(max_rounds):
+        round_num = i + 1
+        print(f"-------------------- 第 {round_num} 轮 --------------------")
+
+        # == 正方发言 ==
+        pro_prompt = f"""你是正方辩手，你的角色是：{pro_role}。
+辩论主题：“{topic}”。你的核心立场是支持这个主题。
+这是你之前的发言，作为参考：{[msg['content'] for msg in debate_history if msg['role'] == '正方']}
+这是你的对手（反方）的发言：{[msg['content'] for msg in debate_history if msg['role'] == '反方']}
+现在轮到你发言。请根据你角色的立场，有逻辑地陈述你的观点。如果这是第一轮，请进行开篇立论。如果是后续轮次，请在陈述新观点的同时，反驳反方上一轮的观点。
+请直接开始你的发言。"""
+        pro_messages = [{"role": "system", "content": pro_system_prompt or pro_prompt}]
+        # 将相关历史加入上下文，但为了节省token，可以只加入最近几轮
+        pro_messages.extend([{"role": "user" if m["role"] == "反方" else "assistant", "content": m["content"]} for m in debate_history if m["role"] in ["正方", "反方"]])
         
-        # 正方发言
-        print(f"\n--- 正方 ({pro_desc}) ---")
-        prompt_pro = "现在轮到正方发言。请陈述你的观点或反驳对方。"
-        history.append({"role": "user", "content": prompt_pro})
-        pro_statement = pro_agent.speak(history)
-        print(pro_statement)
-        history.pop() # 移除临时提示
-        history.append({"role": "assistant", "role_name": f"正方 ({pro_desc})", "content": pro_statement})
-
-        # 反方发言
-        print(f"\n--- 反方 ({con_desc}) ---")
-        prompt_con = "现在轮到反方发言。请陈述你的观点或反驳对方。"
-        history.append({"role": "user", "content": prompt_con})
-        con_statement = con_agent.speak(history)
-        print(con_statement)
-        history.pop() # 移除临时提示
-        history.append({"role": "assistant", "role_name": f"反方 ({con_desc})", "content": con_statement})
+        pro_statement = get_ai_response(client, debater_model, pro_messages)
+        print(f"\n--- 正方 (角色: {pro_role}) ---\n{pro_statement}\n")
+        debate_history.append({"role": "正方", "content": pro_statement})
         
-        # 裁判串场 (可选，最后一轮后不再串场)
-        if i < max_rounds:
-            print("\n--- 裁判 ---")
-            transition_prompt = "请对刚才的第"+str(i)+"轮进行一个简短的总结，并宣布下一轮开始。"
-            history.append({"role": "user", "content": transition_prompt})
-            transition_statement = referee_agent.speak(history)
-            print(transition_statement)
-            history.pop()
-            history.append({"role": "assistant", "role_name": "裁判", "content": transition_statement})
+        # == 裁判串场 (邀请反方) ==
+        judge_crosstalk_prompt = f"""你是一位中立的裁判。正方刚刚完成了发言。
+正方发言内容：“{pro_statement}”
+请简单总结一下正方的观点，然后邀请反方（角色：{con_role}）进行回应或陈述。保持简洁、中立。"""
+        judge_messages.append({"role": "user", "content": judge_crosstalk_prompt})
+        crosstalk = get_ai_response(client, judge_model, judge_messages)
+        print(f"\n--- 裁判 ---\n{crosstalk}\n")
+        debate_history.append({"role": "裁判", "content": crosstalk})
+        judge_messages.append({"role": "assistant", "content": crosstalk})
+
+        # == 反方发言 ==
+        con_prompt = f"""你是反方辩手，你的角色是：{con_role}。
+辩论主题：“{topic}”。你的核心立场是反对这个主题。
+这是你之前的发言，作为参考：{[msg['content'] for msg in debate_history if msg['role'] == '反方']}
+这是你的对手（正方）的发言：{[msg['content'] for msg in debate_history if msg['role'] == '正方']}
+现在轮到你发言。请根据你角色的立场，有逻辑地陈述你的观点，并针对性地反驳正方刚刚的发言：“{pro_statement}”。
+请直接开始你的发言。"""
+        con_messages = [{"role": "system", "content": con_system_prompt or con_prompt}]
+        con_messages.extend([{"role": "user" if m["role"] == "正方" else "assistant", "content": m["content"]} for m in debate_history if m["role"] in ["正方", "反方"]])
+
+        con_statement = get_ai_response(client, debater_model, con_messages)
+        print(f"\n--- 反方 (角色: {con_role}) ---\n{con_statement}\n")
+        debate_history.append({"role": "反方", "content": con_statement})
+
+        # == 裁判串场 (准备下一轮或总结) ==
+        if round_num < max_rounds:
+            judge_crosstalk_prompt_2 = f"""你是一位中立的裁判。反方刚刚完成了发言。
+反方发言内容：“{con_statement}”
+请简单总结，并宣布进入下一轮辩论，再次邀请正方发言。"""
+            judge_messages.append({"role": "user", "content": judge_crosstalk_prompt_2})
+            crosstalk = get_ai_response(client, judge_model, judge_messages)
+            print(f"\n--- 裁判 ---\n{crosstalk}\n")
+            debate_history.append({"role": "裁判", "content": crosstalk})
+            judge_messages.append({"role": "assistant", "content": crosstalk})
+
+    # --- 最终裁决 ---
+    print("==================== 辩论结束 ====================")
+    judge_final_prompt = f"""你是一位专业的辩论裁判。一场关于“{topic}”的辩论刚刚结束。
+以下是完整的辩论记录：
+{json.dumps(debate_history, ensure_ascii=False, indent=2)}
+
+你的任务是：
+1.  首先，感谢双方辩手的精彩表现。
+2.  综合双方在整个辩论过程中的逻辑严谨性、论据充分性、临场反应和角色扮演的契合度。
+3.  基于上述标准，宣布哪一方获胜。
+4.  详细解释你做出这个裁决的理由，具体指出获胜方在哪些方面做得更好，以及失利方可能存在的不足。
+你的裁决必须公正、有说服力。"""
+    judge_messages.append({"role": "user", "content": judge_final_prompt})
+    final_verdict = get_ai_response(client, judge_model, judge_messages)
+    print(f"\n--- 裁判最终裁决 ---\n{final_verdict}\n")
+    debate_history.append({"role": "裁判最终裁决", "content": final_verdict})
+
+    return debate_history
+
+# --- 4. 结果保存 ---
+def save_json_record(debate_history, base_filename, debate_settings):
+    """将包含设置和历史的完整记录保存为 JSON 文件。"""
+    filename = f"{base_filename}.json"
+    record = {
+        "settings": debate_settings,
+        "history": debate_history
+    }
+    try:
+        with open(filename, 'w', encoding='utf-8') as f:
+            json.dump(record, f, ensure_ascii=False, indent=4)
+        print(f"[+] 完整的JSON记录已保存至: {filename}")
+    except IOError as e:
+        print(f"[!] 错误：无法写入 JSON 文件 {filename}。原因: {e}")
+
+def save_text_record(debate_history, base_filename):
+    """将辩论记录保存为易读的 TXT 文件。"""
+    filename = f"{base_filename}.txt"
+    try:
+        with open(filename, 'w', encoding='utf-8') as f:
+            for message in debate_history:
+                f.write(f"--- {message['role']} ---\n")
+                f.write(f"{message['content']}\n\n")
+        print(f"[+] 易读的文本记录已保存至: {filename}")
+    except IOError as e:
+        print(f"[!] 错误：无法写入文本文件 {filename}。原因: {e}")
+
+# ==========================================================
+# ================ 新增的 Markdown 保存功能 ================
+# ==========================================================
+def save_markdown_record(debate_history, base_filename, debate_settings):
+    """将辩论记录保存为格式化的 Markdown 文件。"""
+    filename = f"{base_filename}.md"
+    try:
+        with open(filename, 'w', encoding='utf-8') as f:
+            # 写入主标题
+            f.write(f"# 辩论主题：{debate_settings['topic']}\n\n")
+
+            # 写入辩论设置作为引述块
+            f.write("> **辩论设置**\n")
+            f.write(">\n")
+            f.write(f"> - **正方**: {debate_settings['pro_role']}\n")
+            f.write(f"> - **反方**: {debate_settings['con_role']}\n")
+            f.write(f"> - **最大轮数**: {debate_settings['max_rounds']}\n\n")
+
+            f.write("---\n\n") # 水平分割线
+
+            # 遍历并写入辩论历史
+            for message in debate_history:
+                role = message['role']
+                content = message['content']
+
+                # 使用三级标题表示发言者，使其突出
+                f.write(f"### **{role}**\n\n")
+                
+                # 将发言内容放入引述块，以实现清晰的视觉分隔
+                # 并正确处理内容中的换行
+                formatted_content = '> ' + content.replace('\n', '\n> ')
+                f.write(f"{formatted_content}\n\n")
+
+        print(f"[+] Markdown 格式记录已保存至: {filename}")
+    except IOError as e:
+        print(f"[!] 错误：无法写入 Markdown 文件 {filename}。原因: {e}")
 
 
-    # --- 宣布结果 ---
-    print("\n" + "="*20 + " 辩论结束 " + "="*20)
-    print("\n--- 裁判最终裁决 ---")
-    
-    judgement_prompt = "辩论已结束。请根据双方的整体表现，综合评估其论证的逻辑性、说服力、证据支持和反驳能力，宣布获胜方，并提供详细、公正的评判理由。"
-    history.append({"role": "user", "content": judgement_prompt})
-    final_judgement = referee_agent.speak(history)
-    print(final_judgement)
-    history.pop()
-    history.append({"role": "assistant", "role_name": "裁判 (最终裁决)", "content": final_judgement})
-
-    # --- 保存记录 ---
-    save_debate_records(topic, history)
-
-
-# --- 5. 程序入口 ---
-if __name__ == "__main__":
+# --- 5. 主函数 ---
+def main():
+    """程序主入口"""
+    debate_history = []
+    debate_settings = {}
     try:
         config = load_config()
-        # 验证API Key是否存在
-        if 'xxxxxxxx' in config['api_key'] or not config['api_key']:
-             print("错误：请在 config.ini 文件中设置您的 OpenAI API Key。")
-        else:
-            # 初始化 OpenAI 客户端
-            # 注意：请确保已安装 openai 库 (pip install openai)
-            client = OpenAI(
-                api_key=config['api_key'],
-                base_url=config['base_url'],
-            )
-            run_debate(
-                client=client,
-                model_name=config['model_name'],
-                judge_model_name=config['judge_model_name']
-            )
+        client = openai.OpenAI(api_key=config['api_key'], base_url=config['base_url'])
+
+        print("--- 欢迎来到AI自动辩论工具 ---")
+        topic = input("请输入辩论主题: ")
+        while True:
+            try:
+                max_rounds = int(input("请输入最大辩论轮数: "))
+                break
+            except ValueError:
+                print("无效输入，请输入一个整数。")
+        
+        print("--- 设置双方角色信息 ---")
+        pro_role = input("请输入支持方(正方)的角色描述 (例如：一位推崇自由办公的互联网公司HR): ")
+        con_role = input("请输入反对方的角色描述 (例如：一位注重团队协作和管理效率的传统企业CEO): ")
+        
+        print("\n您可以为AI提供更底层的指令 (System Message)，留空则使用默认值。")
+        pro_system_prompt = input("请输入正方的 System Message (可选): ")
+        con_system_prompt = input("请输入反方的 System Message (可选): ")
+        
+        debate_settings = {
+            'topic': topic,
+            'max_rounds': max_rounds,
+            'pro_role': pro_role,
+            'con_role': con_role,
+            'pro_system_prompt': pro_system_prompt,
+            'con_system_prompt': con_system_prompt,
+            'model_name': config['model_name'],
+            'judge_model_name': config['judge_model_name']
+        }
+        
+        debate_history = run_debate(client, debate_settings)
 
     except FileNotFoundError as e:
         print(e)
+    except KeyboardInterrupt:
+        print("\n[!] 用户中断了程序。")
     except Exception as e:
-        print(f"程序运行出现未知错误: {e}")
+        print(f"\n[!] 发生未知错误: {e}")
+    finally:
+        if debate_history:
+            # 清理主题字符串，使其可作为文件名
+            safe_topic = re.sub(r'[\\/*?:"<>|]', "", topic)[:50]
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            base_filename = f"debates/{timestamp}_{safe_topic}"
+            
+            # 创建debates目录 (如果不存在)
+            if not os.path.exists('debates'):
+                os.makedirs('debates')
 
+            save_json_record(debate_history, base_filename, debate_settings)
+            save_text_record(debate_history, base_filename)
+            # ==================================================
+            # ================ 调用新增的保存功能 ================
+            # ==================================================
+            save_markdown_record(debate_history, base_filename, debate_settings)
+
+if __name__ == "__main__":
+    main()

@@ -33,7 +33,7 @@
 
 ### 第一步：下载项目文件
 
-将 `debate_tool.py` 和 `README.md` 文件下载到您本地的 `ai-debate-tool` 文件夹中。
+使用`git clone git@github.com:lilynas/aidebate.git`到您的项目。
 
 ### 第二步：创建并配置 `config.ini`
 
